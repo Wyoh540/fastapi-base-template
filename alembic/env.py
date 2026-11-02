@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from src.auth import models as _auth_models  # noqa: F401
 from src.config import settings
 from src.models import Base
+from src.permission import models as _permission_models  # noqa: F401
 from src.posts import models as _posts_models  # noqa: F401
 
 # this is the Alembic Config object, which provides

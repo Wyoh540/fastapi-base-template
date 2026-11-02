@@ -18,6 +18,8 @@ dependencies = [
     "python-multipart>=0.0.9",
     "aiosqlite>=0.20",
     "asyncpg>=0.29",
+    "pycasbin>=2.8.0",
+    "casbin-async-sqlalchemy-adapter>=1.17.0",
 ]
 
 [project.optional-dependencies]

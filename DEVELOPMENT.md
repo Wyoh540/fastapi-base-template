@@ -77,6 +77,100 @@ curl -X POST http://127.0.0.1:8000/api/v1/auth/refresh \
 | `POST /api/v1/auth/login` | OAuth2 password form |
 | `POST /api/v1/auth/refresh` | OAuth2 refresh_token form（或 Cookie） |
 
+## 授权：Casbin RBAC
+
+`src/permission/` 是独立领域，用 [Casbin](https://casbin.org) 做 RBAC 授权。
+依赖 `pycasbin`（导入名是 `casbin`）与官方异步适配器 `casbin-async-sqlalchemy-adapter`。
+
+### 存储分工
+
+| 表 | 内容 | 说明 |
+| --- | --- | --- |
+| `role` | 角色定义（name + description） | name 即 Casbin 策略的主体名 |
+| `user_role` | 谁拥有哪个角色 | **唯一真相**，双外键 CASCADE |
+| `casbin_rule` | 角色 → 权限（`p` 策略） | Casbin 原生结构：`ptype` + `v0..v5` |
+
+Casbin 的 `g`（角色归属）策略**不落库**：每次请求从 `user_role` 读出关联，注入 enforcer
+内存中的 g 段。因此不存在两份"谁是什么角色"的真相，也不需要双写同步。
+
+`casbin_rule` 用适配器提供的 `create_casbin_rule_model(Base, "casbin_rule")` 挂到项目自己的
+`Base` 上，所以 Alembic 照常管理它。
+
+### 请求管线
+
+受保护端点声明自己需要的权限（方法 + 路径模式）：
+
+```python
+CanListRoles = Annotated[
+    User, Depends(require_permission("GET", "/api/v1/permission/roles"))
+]
+
+
+@router.get("/roles", response_model=list[RoleRead])
+async def list_roles(_: CanListRoles, session: DbSession) -> list[dict]:
+    ...
+```
+
+判定过程见 `src/permission/enforcer.py`：
+
+1. 读 `casbin_rule` 的 `p` 策略（一次全表 SELECT）
+2. 读当前用户的 `user_role` 关联
+3. `enable_auto_save(False)` 后把关联注入内存 g 段，再显式 `build_role_links()`
+4. `enforce(sub, obj, act)` —— 同步、纯内存
+
+策略每请求加载，改完立即生效，也不存在多进程缓存不一致的问题。代价是每个受保护请求多两次
+查询；策略表变大时可换成带 TTL 的单例缓存。
+
+### 模型
+
+`src/permission/model.conf`：
+
+```ini
+[request_definition]
+r = sub, obj, act
+
+[policy_definition]
+p = sub, obj, act
+
+[role_definition]
+g = _, _
+
+[policy_effect]
+e = some(where (p.eft == allow))
+
+[matchers]
+m = g(r.sub, p.sub) && keyMatch(r.obj, p.obj) && r.act == p.act
+```
+
+`sub` 是用户 UUID，`obj` 是路径模式（`keyMatch` 做通配），`act` 是 HTTP 方法。
+
+### 种子
+
+启动时（`PERMISSION_SEED_ENABLED=true`）幂等写入，重复执行无副作用：
+
+| 角色 | 权限 |
+| --- | --- |
+| `admin` | `/api/v1/permission/*` 与 `/api/v1/posts/*` 的 GET/POST/PUT/DELETE |
+| `editor` | `/api/v1/posts/*` 的 GET/POST/PUT |
+| `reader` | `/api/v1/posts/*` 的 GET |
+
+`PERMISSION_SEED_ADMIN_EMAIL` 对应的账号会被授予 `admin` 角色；账号不存在则自动创建，密码取
+`PERMISSION_SEED_ADMIN_PASSWORD`，未配置则随机生成并打印一次。生产环境应在角色就位后把
+`PERMISSION_SEED_ENABLED` 关掉。
+
+`admin` 角色不可删除（服务层拒绝），避免把最后一个管理员降权后无人能再管理策略。
+`posts` 的权限策略目前只是预置——`posts` 端点仍用所有权判断，尚未接入 RBAC 判定。
+
+### 踩坑清单
+
+- **不要调用 `adapter.create_table()`**：适配器会把自己的 `Base.metadata` 指向我们的 metadata，
+  调用它会按项目模型建出**全部**表。本项目的 schema 一律由 Alembic 管理。
+- **不要调用 `save_policy()`**：它先 `DELETE` 全表再重写，是全量覆盖而非增量保存。本模块的
+  策略增删改走 ORM（`src/permission/service.py`）。
+- `casbin_rule` 的 `v0..v5` 不能出现空洞：适配器按 `str(row)` 解析，遇 `None` 即截断。
+- `add_grouping_policy()` 之后必须显式 `build_role_links()`，Casbin 不会自动重建角色链。
+- `enforce()` 是同步的；异步的只有 `load_policy()` / `add_policy()` 这些 I/O。
+
 ## 分页
 
 分页是横切关注点，不归属任何单一领域，因此放在全局模块 `src/pagination.py`，
@@ -113,6 +207,17 @@ src/
 │   ├── exceptions.py# 领域异常
 │   └── utils.py     # 纯工具函数
 ├── posts/           # 帖子领域：CRUD、分页、所有权校验
+├── permission/      # 授权领域：Casbin RBAC、角色与策略管理
+│   ├── router.py    # 策略管理端点
+│   ├── schemas.py   # Pydantic 模型
+│   ├── models.py    # role / user_role / casbin_rule ORM 模型
+│   ├── service.py   # 业务逻辑
+│   ├── dependencies.py  # require_permission(...) 依赖
+│   ├── enforcer.py  # enforcer 构建与每请求判定管线
+│   ├── config.py    # 领域配置（env 前缀 PERMISSION_）
+│   ├── constants.py # 常量与错误码
+│   ├── exceptions.py# 领域异常
+│   └── model.conf   # Casbin 模型定义
 ├── config.py        # 全局配置
 ├── pagination.py    # 全局分页：PaginationParams / PaginatedResponse / 分页依赖
 ├── models.py        # 共享 ORM 基类与 mixin
@@ -131,6 +236,9 @@ tests/               # 测试目录镜像 src/ 的领域划分
 │   └── test_auth.py
 ├── posts/           # ↔ src/posts/
 │   └── test_posts.py
+├── permission/      # ↔ src/permission/
+│   ├── conftest.py  # 领域 fixtures（种子管理员、普通成员）
+│   └── test_permissions.py
 ├── pagination/      # ↔ src/pagination.py（全局模块）
 │   └── test_pagination.py
 └── test_health.py   # ↔ src/main.py 的运维端点
@@ -159,6 +267,16 @@ from src.posts.constants import ErrorCode as PostsErrorCode
 | PATCH | `/api/v1/posts/{id}` | 更新（仅作者） |
 | DELETE | `/api/v1/posts/{id}` | 删除（仅作者） |
 | POST | `/api/v1/posts/{id}/views` | 浏览计数 +1 |
+| GET | `/api/v1/permission/roles` | 角色列表（含各自权限） |
+| POST | `/api/v1/permission/roles` | 创建角色 |
+| GET | `/api/v1/permission/roles/{role}` | 角色详情 |
+| DELETE | `/api/v1/permission/roles/{role}` | 删除角色（`admin` 不可删） |
+| GET | `/api/v1/permission/roles/{role}/permissions` | 角色权限列表 |
+| PUT | `/api/v1/permission/roles/{role}/permissions` | 授予权限（幂等） |
+| DELETE | `/api/v1/permission/roles/{role}/permissions/{id}` | 撤销权限 |
+| GET | `/api/v1/permission/users/{id}/roles` | 用户的角色 |
+| PUT | `/api/v1/permission/users/{id}/roles/{role}` | 授予角色（幂等） |
+| DELETE | `/api/v1/permission/users/{id}/roles/{role}` | 撤销角色 |
 | GET | `/health` `/ready` | 运维探针 |
 
 ## 错误响应

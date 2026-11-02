@@ -10,8 +10,16 @@ from src.auth.config import auth_settings
 from src.auth.models import User  # noqa: F401  (registers the `user` table on Base.metadata)
 from src.auth.router import router as auth_router
 from src.config import API_PREFIX, settings
-from src.database import Base, engine
+from src.database import Base, SessionFactory, engine
 from src.exceptions import register_exception_handlers
+from src.permission import service as permission_service
+from src.permission.config import permission_settings
+from src.permission.models import (  # noqa: F401  (registers the permission tables)
+    CasbinRule,
+    Role,
+    UserRole,
+)
+from src.permission.router import router as permission_router
 from src.posts.models import Post  # noqa: F401  (registers the `post` table on Base.metadata)
 from src.posts.router import router as posts_router
 
@@ -37,11 +45,14 @@ def _assert_secrets_configured() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Create tables locally for a zero-setup dev loop; dispose the engine on shutdown."""
+    """Create tables locally for a zero-setup dev loop; seed the RBAC defaults."""
     _assert_secrets_configured()
     if settings.is_local and settings.AUTO_CREATE_TABLES:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+    if permission_settings.SEED_ENABLED:
+        async with SessionFactory() as session:
+            await permission_service.seed(session)
     yield
     await engine.dispose()
 
@@ -71,6 +82,7 @@ def create_app() -> FastAPI:
 
     app.include_router(auth_router, prefix=API_PREFIX)
     app.include_router(posts_router, prefix=API_PREFIX)
+    app.include_router(permission_router, prefix=API_PREFIX)
 
     @app.get("/health", tags=["ops"], summary="Liveness probe")
     async def health() -> dict[str, str]:
